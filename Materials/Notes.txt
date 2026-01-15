@@ -1,0 +1,9 @@
+SORTOWANIE
+
+sort po cenie:
+
+sorted(material_library, key=lambda m: m.cena_kg)
+
+sort po typ → gatunek → rozmiar:
+
+sorted(material_library, key=lambda m: (m.typ, m.gatunek, m.rozmiar))
