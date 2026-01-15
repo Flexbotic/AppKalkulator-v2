@@ -7,7 +7,8 @@ from typing import Any
 
 from openpyxl import load_workbook
 
-from Workcell._workcell_definitions import Workcell, ParamChoice, ParamNumber, ParamTablePick
+from Workcell._workcell_definitions import Workcell, ParamNumber, ParamTablePick
+
 
 WORKCELL_DIR = Path(__file__).parent
 PROJECT_ROOT = WORKCELL_DIR.parent
@@ -15,10 +16,16 @@ PROJECT_ROOT = WORKCELL_DIR.parent
 
 @dataclass
 class CostData:
-    # workcell_id -> choice_value -> param_key -> value
-    numbers: dict[int, dict[str, dict[str, float]]]
-    # workcell_id -> choice_value -> table_name -> item_key -> value
-    tables: dict[int, dict[str, dict[str, dict[str, float]]]]
+    # wc_id -> choice -> formula_id -> param_key -> value
+    numbers: dict[int, dict[str, dict[str, dict[str, float]]]]
+    # wc_id -> choice -> formula_id -> table_param_key -> item_name -> value
+    tables: dict[int, dict[str, dict[str, dict[str, dict[str, float]]]]]
+
+    def get_number(self, wc_id: int, choice: str, formula_id: str, key: str) -> float:
+        return self.numbers[wc_id][choice][formula_id][key]
+
+    def get_table_value(self, wc_id: int, choice: str, formula_id: str, table_param_key: str, item_name: str) -> float:
+        return self.tables[wc_id][choice][formula_id][table_param_key][item_name]
 
 
 def _import_module(path: Path) -> Any:
@@ -51,155 +58,207 @@ def load_workcell_definitions() -> dict[int, Workcell]:
 
 
 def _to_float(v: Any) -> float:
-    if v is None or (isinstance(v, str) and not v.strip()):
+    if v is None:
         raise ValueError("Empty cost value")
     if isinstance(v, (int, float)):
         return float(v)
     if isinstance(v, str):
-        # PL: przecinek dziesiętny
-        return float(v.strip().replace(" ", "").replace(",", "."))
+        s = v.strip()
+        if not s:
+            raise ValueError("Empty cost value")
+        # PL: przecinek dziesiętny + spacje tysięcy
+        s = s.replace(" ", "").replace("\u00A0", "").replace(",", ".")
+        return float(s)
     raise ValueError(f"Unsupported value type: {type(v)} ({v!r})")
 
 
 def load_costs_from_excel(xlsx_path: Path, workcells: dict[int, Workcell]) -> CostData:
     """
-    Czyta Koszty_template.xlsx wygenerowany Twoim generatorem.
-    Zwraca koszty w strukturze numbers/tables.
+    Czyta Koszty_template.xlsx wygenerowany nowym generatorem:
+    - ParamNumber(cost_table) są w arkuszach WC__<Gniazdo> (o ile istnieją)
+    - ParamTablePick(cost_table) są w arkuszach WC_<Gniazdo>_<param_key>
+      i mają bloki: "choice=... | formula=..." + tabela 2 kolumny (item_name | value)
     """
     wb = load_workbook(xlsx_path, data_only=True)
 
-    numbers: dict[int, dict[str, dict[str, float]]] = {}
-    tables: dict[int, dict[str, dict[str, dict[str, float]]]] = {}
+    numbers: dict[int, dict[str, dict[str, dict[str, float]]]] = {}
+    tables: dict[int, dict[str, dict[str, dict[str, dict[str, float]]]]] = {}
 
-    # Map: sheet "WC__{name}" -> workcell_id
-    # Najpewniej po nazwie w INDEX (id + name), a nie po samej nazwie arkusza.
     if "INDEX" not in wb.sheetnames:
         raise ValueError("Excel missing INDEX sheet")
 
+    # INDEX: workcell_id, name, source_file
     index_ws = wb["INDEX"]
-    # header: workcell_id, name, source_file
     name_to_id: dict[str, int] = {}
     for row in index_ws.iter_rows(min_row=2, values_only=True):
         if not row or row[0] is None:
             continue
-        wc_id = int(row[0])
-        wc_name = str(row[1])
-        name_to_id[wc_name] = wc_id
+        name_to_id[str(row[1])] = int(row[0])
 
+    # pomocnicze: lista nazw gniazd do dopasowania w arkuszach WC_<gniazdo>_<param_key>
+    wc_names_sorted = sorted(name_to_id.keys(), key=len, reverse=True)
+
+    def ensure(wc_id: int, choice: str, formula_id: str):
+        numbers.setdefault(wc_id, {}).setdefault(choice, {}).setdefault(formula_id, {})
+        tables.setdefault(wc_id, {}).setdefault(choice, {}).setdefault(formula_id, {})
+
+    def is_blank(v: Any) -> bool:
+        return v is None or (isinstance(v, str) and not v.strip())
+
+    # -------------------------
+    # A) WC__<Gniazdo> (ParamNumber)
+    # -------------------------
     for sheet_name in wb.sheetnames:
         if not sheet_name.startswith("WC__"):
             continue
+
         ws = wb[sheet_name]
         wc_name = sheet_name.replace("WC__", "", 1)
+
         if wc_name not in name_to_id:
-            # jeśli ktoś zmieni nazwę arkusza ręcznie, wolę fail fast
             raise ValueError(f"Sheet {sheet_name} not found in INDEX (workcell name mismatch)")
         wc_id = name_to_id[wc_name]
 
-        if wc_id not in workcells:
+        wc_def = workcells.get(wc_id)
+        if wc_def is None:
             raise ValueError(f"Workcell id={wc_id} from INDEX not found in definitions")
 
-        wc_def = workcells[wc_id]
-        choice_params = [p for p in wc_def.params if isinstance(p, ParamChoice)]
-        if len(choice_params) > 1:
-            raise ValueError(f"Workcell '{wc_def.name}' has >1 choice (unsupported by simple loader)")
-
-        if len(choice_params) == 1:
-            choice_key = choice_params[0].key
-            choice_values = list(choice_params[0].options or [])
+        if wc_def.choice_param:
+            choice_key = wc_def.choice_param.key
+            choice_values = list(wc_def.choice_param.options or [])
         else:
             choice_key = "DEFAULT"
             choice_values = ["DEFAULT"]
 
-        needed_numbers = [
-            p for p in wc_def.params if isinstance(p, ParamNumber) and p.source == "cost_table"
-        ]
-        needed_tables = [
-            p for p in wc_def.params if isinstance(p, ParamTablePick) and p.source == "cost_table"
-        ]
-
-        numbers.setdefault(wc_id, {})
-        tables.setdefault(wc_id, {})
-
-        # Parser arkusza: idziemy wierszami i łapiemy sekcje:
-        # - linia z "choice_key = value"
-        # - nagłówek tabelki numbers
-        # - wiersze numbers aż do pustego / czegoś innego
-        # - potem TABLE: X + nagłówek + wiersze itemów
         current_choice: str | None = None
+        current_formula_id: str | None = None
+
         i = 1
         max_row = ws.max_row
 
-        def cell(r: int, c: int) -> Any:
-            return ws.cell(row=r, column=c).value
-
         while i <= max_row:
-            a = cell(i, 1)
+            a = ws.cell(row=i, column=1).value
+
+            # choice line: "<choice_key> = <value>"
             if isinstance(a, str) and a.strip().startswith(f"{choice_key} ="):
-                # np. "typ_ocynku = OGNIOWY"
                 current_choice = a.split("=", 1)[1].strip()
                 if current_choice not in choice_values:
-                    # może ktoś zmienił w excelu
                     raise ValueError(f"{sheet_name}: unknown choice '{current_choice}' (expected {choice_values})")
-
-                numbers[wc_id].setdefault(current_choice, {})
-                tables[wc_id].setdefault(current_choice, {})
+                current_formula_id = None
                 i += 1
                 continue
 
-            # NUMBERS header row: ["param_key","label","unit","value"]
-            if current_choice is not None and str(a).strip() == "param_key" and str(cell(i, 4)).strip() == "value":
+            # formula line: "Formula: <id> - <label>"
+            if isinstance(a, str) and a.strip().startswith("Formula:"):
+                s = a.strip()[len("Formula:"):].strip()
+                current_formula_id = s.split(" - ", 1)[0].strip() if " - " in s else s.strip()
+                if current_choice is None:
+                    current_choice = "DEFAULT"
+                ensure(wc_id, current_choice, current_formula_id)
                 i += 1
-                # wiersze numbers
-                seen_keys = set()
+                continue
+
+            # header row: param_key ... value (col4)
+            if (
+                current_choice is not None
+                and current_formula_id is not None
+                and isinstance(a, str)
+                and a.strip() == "param_key"
+                and str(ws.cell(row=i, column=4).value).strip() == "value"
+            ):
+                i += 1
                 while i <= max_row:
-                    pk = cell(i, 1)
-                    val = cell(i, 4)
-                    if pk is None:
+                    pk = ws.cell(row=i, column=1).value
+                    if is_blank(pk):
                         break
                     pk_s = str(pk).strip()
-                    if pk_s.startswith("TABLE:"):
-                        break
-                    # tylko te, które są w definicji (żeby nie połknąć śmieci)
-                    if pk_s in {p.key for p in needed_numbers}:
-                        if val is None or (isinstance(val, str) and not val.strip()):
-                            raise ValueError(f"{sheet_name} ({current_choice}): missing value for {pk_s}")
-                        numbers[wc_id][current_choice][pk_s] = _to_float(val)
-                        seen_keys.add(pk_s)
-                    i += 1
 
-                # walidacja: czy wszystkie koszty są wpisane
-                missing = [p.key for p in needed_numbers if p.key not in numbers[wc_id][current_choice]]
-                if missing:
-                    raise ValueError(f"{sheet_name} ({current_choice}): missing cost values for: {missing}")
+                    val = ws.cell(row=i, column=4).value
+                    if is_blank(val):
+                        raise ValueError(f"{sheet_name} ({current_choice}) formula={current_formula_id}: missing value for {pk_s}")
+
+                    numbers[wc_id][current_choice][current_formula_id][pk_s] = _to_float(val)
+                    i += 1
                 continue
 
-            # TABLE section
-            if current_choice is not None and isinstance(a, str) and a.strip().startswith("TABLE:"):
-                table_name = a.split(":", 1)[1].strip()
-                if table_name not in {t.table_name for t in needed_tables}:
-                    # ignoruj nieznane (lub fail fast - jak wolisz)
-                    # ja wolę fail fast, bo to literówka w excelu:
-                    raise ValueError(f"{sheet_name} ({current_choice}): unknown table '{table_name}'")
-                tables[wc_id][current_choice].setdefault(table_name, {})
+            i += 1
 
-                # następny wiersz to header item_key/value itd.
-                i += 1
-                # spodziewamy się nagłówka: item_key ... value
-                if str(cell(i, 1)).strip() != "item_key" or str(cell(i, 4)).strip() != "value":
-                    raise ValueError(f"{sheet_name} ({current_choice}) TABLE {table_name}: bad header row")
-                i += 1
+    # -------------------------
+    # B) WC_<Gniazdo>_<param_key> (ParamTablePick)
+    # -------------------------
+    for sheet_name in wb.sheetnames:
+        if sheet_name == "INDEX" or sheet_name.startswith("WC__"):
+            continue
+        if not sheet_name.startswith("WC_"):
+            continue
 
-                # czytamy aż do pustego item_key
+        ws = wb[sheet_name]
+        rest = sheet_name[len("WC_"):]
+
+        wc_name = None
+        table_param_key = None
+        for cand in wc_names_sorted:
+            prefix = f"{cand}_"
+            if rest.startswith(prefix):
+                wc_name = cand
+                table_param_key = rest[len(prefix):]
+                break
+        if wc_name is None or table_param_key is None:
+            raise ValueError(f"Cannot parse TablePick sheet name: {sheet_name}")
+
+        wc_id = name_to_id[wc_name]
+        wc_def = workcells.get(wc_id)
+        if wc_def is None:
+            raise ValueError(f"Workcell id={wc_id} not found in definitions")
+
+        if wc_def.choice_param:
+            choice_key = wc_def.choice_param.key
+            choice_values = list(wc_def.choice_param.options or [])
+        else:
+            choice_key = "DEFAULT"
+            choice_values = ["DEFAULT"]
+
+        i = 1
+        max_row = ws.max_row
+
+        while i <= max_row:
+            a = ws.cell(row=i, column=1).value
+
+            # tytuł bloku: "<choice_key>=<cv> | formula=<id> (..)"
+            if isinstance(a, str) and "|" in a and "formula=" in a:
+                title = a.strip()
+
+                left = title.split("|", 1)[0].strip()  # "typ=OGNIOWY"
+                if "=" not in left:
+                    raise ValueError(f"{sheet_name}: bad block title (no '='): {title}")
+                ck, cv = [x.strip() for x in left.split("=", 1)]
+                if ck != choice_key:
+                    raise ValueError(f"{sheet_name}: bad choice key '{ck}', expected '{choice_key}'")
+                if cv not in choice_values:
+                    raise ValueError(f"{sheet_name}: unknown choice '{cv}' (expected {choice_values})")
+
+                right = title.split("|", 1)[1].strip()  # "formula=by_dm2 (...)"
+                if not right.startswith("formula="):
+                    raise ValueError(f"{sheet_name}: bad block title (no 'formula='): {title}")
+                fid_part = right[len("formula="):].strip()
+                formula_id = fid_part.split(" (", 1)[0].strip() if " (" in fid_part else fid_part.split()[0].strip()
+
+                ensure(wc_id, cv, formula_id)
+
+                # następny wiersz: nagłówek 2 kolumny (nie musimy walidować treści)
+                i += 2
+
+                tables[wc_id][cv][formula_id].setdefault(table_param_key, {})
+
                 while i <= max_row:
-                    item_key = cell(i, 1)
-                    val = cell(i, 4)
-                    if item_key is None or (isinstance(item_key, str) and not item_key.strip()):
+                    item_name = ws.cell(row=i, column=1).value
+                    val = ws.cell(row=i, column=2).value
+                    if is_blank(item_name):
                         break
-                    item_key_s = str(item_key).strip()
-                    if val is None or (isinstance(val, str) and not val.strip()):
-                        raise ValueError(f"{sheet_name} ({current_choice}) TABLE {table_name}: missing value for {item_key_s}")
-                    tables[wc_id][current_choice][table_name][item_key_s] = _to_float(val)
+                    if is_blank(val):
+                        raise ValueError(f"{sheet_name} ({cv}) formula={formula_id} table={table_param_key}: missing value for '{item_name}'")
+
+                    tables[wc_id][cv][formula_id][table_param_key][str(item_name).strip()] = _to_float(val)
                     i += 1
 
                 continue
@@ -221,4 +280,3 @@ def load_workcells_with_costs():
 
     costs = load_costs_from_excel(xlsx_path, workcells)
     return workcells, costs
-

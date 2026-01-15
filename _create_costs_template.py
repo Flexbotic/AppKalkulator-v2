@@ -1,0 +1,2 @@
+from Workcell._generate_cost_template import generate_cost_template
+generate_cost_template()

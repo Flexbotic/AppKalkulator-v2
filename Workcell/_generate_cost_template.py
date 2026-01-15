@@ -88,67 +88,140 @@ def generate_cost_template() -> Path:
 # ---------- generowanie arkuszy ----------
 
 def _generate_workcell_sheet(wb: Workbook, wc: Workcell):
-    ws = wb.create_sheet(_safe_sheet_name(f"WC__{wc.name}"))
 
-    choices = [p for p in wc.params if isinstance(p, ParamChoice)]
-    if len(choices) > 1:
-        raise ValueError(f"Gniazdo '{wc.name}' ma >1 ParamChoice")
-
-    if choices:
-        choice_key = choices[0].key
-        choice_values = choices[0].options
+    choice = wc.choice_param
+    if choice:
+        choice_key = choice.key
+        choice_values = choice.options
     else:
         choice_key = "DEFAULT"
         choice_values = ["DEFAULT"]
 
-    number_params = [
-        p for p in wc.params
-        if isinstance(p, ParamNumber) and p.source == "cost_table"
-    ]
-    table_params = [
-        p for p in wc.params
-        if isinstance(p, ParamTablePick) and p.source == "cost_table"
-    ]
+    # ========= NOWY WARUNEK =========
+    def has_non_table_params() -> bool:
+        for cv in choice_values:
+            for formula in wc.formulas:
+                if not _is_formula_allowed_for_choice(formula, choice_key, cv):
+                    continue
+                for p in formula.params:
+                    if isinstance(p, ParamNumber) and p.source == "cost_table":
+                        return True
+        return False
 
+    create_main_ws = has_non_table_params()
+    ws = None
     row = 1
-    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
-    ws.cell(row=row, column=1, value=f"{wc.name} (id={wc.id})").font = Font(bold=True, size=14)
-    row += 2
 
-    for cv in choice_values:
+    if create_main_ws:
+        ws = wb.create_sheet(_safe_sheet_name(f"WC__{wc.name}"))
         ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
-        ws.cell(row=row, column=1, value=f"{choice_key} = {cv}").font = SECTION_FONT
-        row += 1
+        ws.cell(row=row, column=1, value=f"{wc.name} (id={wc.id})").font = Font(bold=True, size=14)
+        row += 2
+    # ========= KONIEC WARUNKU =========
 
-        ws.append(["param_key", "label", "unit", "value"])
-        for c in range(1, 5):
-            ws.cell(row=row, column=c).fill = HEADER_FILL
-            ws.cell(row=row, column=c).font = HEADER_FONT
-        row += 1
+    # Tworzymy tabele dla każdego choice i każdej formuły
+    for cv in choice_values:
 
-        for p in number_params:
-            ws.append([p.key, p.label, getattr(p, "unit", ""), ""])
+        if ws is not None:
+            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
+            ws.cell(row=row, column=1, value=f"{choice_key} = {cv}").font = SECTION_FONT
             row += 1
 
-        row += 1
+        for formula in wc.formulas:
+            if not _is_formula_allowed_for_choice(formula, choice_key, cv):
+                continue
 
-        for tp in table_params:
-            ws.append([f"TABLE: {tp.table_name}", "", "", ""])
-            ws.cell(row=row, column=1).font = BOLD_FONT
+            # ---------- ParamNumber -> tylko jeśli arkusz główny istnieje ----------
+            number_params = [
+                p for p in formula.params
+                if isinstance(p, ParamNumber) and p.source == "cost_table"
+            ]
+
+            if ws is not None and number_params:
+                ws.append([f"Formula: {formula.id} - {formula.label}", "", "", ""])
+                ws.cell(row=row, column=1).font = BOLD_FONT
+                row += 1
+
+                ws.append(["param_key", "label", "unit", "value"])
+                for c in range(1, 5):
+                    ws.cell(row=row, column=c).fill = HEADER_FILL
+                    ws.cell(row=row, column=c).font = HEADER_FONT
+                row += 1
+
+                for p in number_params:
+                    ws.append([p.key, p.label, getattr(p, "unit", ""), ""])
+                    row += 1
+
+                row += 1
+
+            # ---------- ParamTablePick -> osobne arkusze ----------
+            for tp in formula.params:
+                if isinstance(tp, ParamTablePick) and tp.source == "cost_table":
+                    tname = _tablepick_sheet_name(wc, tp)
+                    tws = _get_or_create_sheet(wb, tname)
+
+                    if tws.max_row == 1 and tws.cell(1, 1).value is None:
+                        tws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=2)
+                        tws.cell(
+                            row=1,
+                            column=1,
+                            value=f"{wc.name} / {tp.table_name}"
+                        ).font = Font(bold=True, size=14)
+                        tws.cell(row=1, column=1).alignment = Alignment(horizontal="center")
+                        next_row = 3
+                    else:
+                        next_row = tws.max_row + 2
+
+                    block_title = f"{choice_key}={cv} | formula={formula.id} ({formula.label})"
+                    next_row = _append_tablepick_block(
+                        tws, block_title, tp, next_row, PLACEHOLDER_ROWS
+                    )
+
+                    _autosize(tws)
+
+        if ws is not None:
             row += 1
 
-            ws.append(["item_key", "label", "unit", "value"])
-            for c in range(1, 5):
-                ws.cell(row=row, column=c).fill = HEADER_FILL
-                ws.cell(row=row, column=c).font = HEADER_FONT
-            row += 1
+    if ws is not None:
+        _autosize(ws)
 
-            row += PLACEHOLDER_ROWS
 
-        row += 1
 
-    _autosize(ws)
+def _is_formula_allowed_for_choice(formula, choice_key: str, choice_value: str) -> bool:
+    """
+    Zwraca True jeśli formuła jest dozwolona dla (choice_key=choice_value).
+    Jeśli brak choice_key (DEFAULT) – traktujemy formułę jako dozwoloną, o ile nie ma reguł wyboru.
+    Jeśli enabled_when puste -> dozwolone zawsze.
+    """
 
+    rules = list(getattr(formula, "enabled_when", []) or [])
+
+    # 1) brak warunków -> dozwolone zawsze
+    if not rules:
+        return True
+
+    # 2) jeżeli ten workcell nie ma choice_param -> choice_key to "DEFAULT"
+    #    a reguły odnoszące się do choice_key nie mogą być spełnione, więc:
+    #    - jeśli formuła ma jakiekolwiek reguły na choice_key, to nie jest dozwolona w DEFAULT
+    if choice_key == "DEFAULT":
+        for r in rules:
+            if getattr(r, "param_key", None) == choice_key:
+                return False
+        # brak reguł na choice -> traktuj jako dozwoloną
+        return True
+
+    # 3) normalny przypadek: mamy choice_key (np typ_ocynku)
+    #    Jeśli istnieją reguły na choice_key, to muszą pasować do choice_value
+    has_choice_rule = False
+    for r in rules:
+        if getattr(r, "param_key", None) == choice_key:
+            has_choice_rule = True
+            if getattr(r, "equals", None) != choice_value:
+                return False
+
+    # jeśli były reguły na choice_key i żadna nie odrzuciła -> OK
+    # jeśli nie było reguł na choice_key -> uznajemy, że formuła dostępna dla wszystkich choice
+    return True
 
 def _index_row(wc: Workcell, filename: str):
     return [
@@ -170,3 +243,100 @@ def _generate_index_sheet(wb: Workbook, rows):
         ws.append(r)
 
     _autosize(ws)
+
+def _tablepick_sheet_name(wc: Workcell, tp: ParamTablePick) -> str:
+    # wymaganie: WC_<gniazdo>_<param_key>
+    return _safe_sheet_name(f"WC_{wc.name}_{tp.key}")
+
+def _get_or_create_sheet(wb: Workbook, title: str):
+    if title in wb.sheetnames:
+        return wb[title]
+    return wb.create_sheet(title)
+
+def _append_name_value_block(ws, title: str, start_row: int, placeholder_rows: int = PLACEHOLDER_ROWS) -> int:
+    """
+    Dodaje blok:
+      <title> (merged)
+      Nazwa | Wartość (header)
+      <placeholder_rows> pustych wierszy
+    Zwraca nowy row pointer.
+    """
+    row = start_row
+
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
+    ws.cell(row=row, column=1, value=title).font = SECTION_FONT
+    ws.cell(row=row, column=1).fill = SECTION_FILL
+    row += 1
+
+    ws.append(["Nazwa", "Wartość"])
+    ws.cell(row=row, column=1).fill = HEADER_FILL
+    ws.cell(row=row, column=1).font = HEADER_FONT
+    ws.cell(row=row, column=2).fill = HEADER_FILL
+    ws.cell(row=row, column=2).font = HEADER_FONT
+    row += 1
+
+    # placeholdery
+    for _ in range(placeholder_rows):
+        ws.append(["", ""])
+        row += 1
+
+    # odstęp
+    row += 1
+    return row
+
+
+def _workcell_has_non_table_cost_params(wc: Workcell, choice_key: str, choice_values: list[str]) -> bool:
+    """
+    True jeśli istnieje przynajmniej jeden ParamNumber(source="cost_table")
+    w jakiejkolwiek formule dozwolonej dla jakiegokolwiek choice.
+    """
+    for cv in choice_values:
+        for formula in wc.formulas:
+            if not _is_formula_allowed_for_choice(formula, choice_key, cv):
+                continue
+            for p in formula.params:
+                if isinstance(p, ParamNumber) and p.source == "cost_table":
+                    return True
+    return False
+
+def _append_tablepick_block(
+    ws,
+    title: str,
+    tp: ParamTablePick,
+    start_row: int,
+    placeholder_rows: int = PLACEHOLDER_ROWS,
+) -> int:
+    """
+    Dodaje blok tabeli ParamTablePick:
+      <title> (merged)
+      <table_name> | <label> <unit>
+      <placeholder_rows> pustych wierszy
+    Zwraca nowy row pointer.
+    """
+    row = start_row
+
+    # tytuł bloku
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
+    ws.cell(row=row, column=1, value=title).font = SECTION_FONT
+    ws.cell(row=row, column=1).fill = SECTION_FILL
+    row += 1
+
+    # nagłówek tabeli
+    col1 = tp.table_name
+    col2 = f"{tp.label} {tp.unit}".strip()
+
+    ws.append([col1, col2])
+    ws.cell(row=row, column=1).fill = HEADER_FILL
+    ws.cell(row=row, column=1).font = HEADER_FONT
+    ws.cell(row=row, column=2).fill = HEADER_FILL
+    ws.cell(row=row, column=2).font = HEADER_FONT
+    row += 1
+
+    # placeholdery
+    for _ in range(placeholder_rows):
+        ws.append(["", ""])
+        row += 1
+
+    # odstęp
+    row += 1
+    return row

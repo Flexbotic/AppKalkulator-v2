@@ -6,7 +6,7 @@ class Workcell:
     id: int
     name: str
     description: str
-    global_params: list["ParamDef"]
+    choice_param: "ParamChoice"
     formulas: list["Formula"]
 
 @dataclass
@@ -28,6 +28,7 @@ class ParamChoice(ParamDef):
 
 @dataclass
 class ParamTablePick(ParamDef):
+    unit: str = ""
     table_name: str = ""
 
 @dataclass

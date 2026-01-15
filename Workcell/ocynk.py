@@ -4,14 +4,13 @@ OCYNK = Workcell(
   id=11,
   name="Ocynk",
   description="...",
-  global_params=[
+  choice_param=
     ParamChoice(key="typ_ocynku", label="Typ ocynku", source="user",
-               options=["OGNIOWY", "GALWANICZNY"])
-  ],
+               options=["OGNIOWY", "GALWANICZNY"]),
   formulas=[
     Formula(
       id="by_kg",
-      label="Wycena (ogniowy) wg masy",
+      label="Wycena wg masy",
       expr="kg * cena_kg",
       params=[
         ParamNumber(key="kg", label="Masa [kg]", source="user", unit="kg", material_value="masa", min_value=0),
@@ -22,7 +21,7 @@ OCYNK = Workcell(
     ),
     Formula(
       id="by_dm2",
-      label="Wycena (galwaniczny) wg powierzchni",
+      label="Wycena wg powierzchni",
       expr="dm2 * cena_dm2",
       params=[
         ParamNumber(key="dm2", label="Powierzchnia [dm²]", source="user", unit="dm2", material_value="powierzchnia", min_value=0),
